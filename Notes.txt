@@ -1,0 +1,39 @@
+Edition features:
+
+Personal Edition:
+$5.99 / mo or $50 upfront
+Access to plugins and mods
+
+Professional Edition:
+$19.99 / Mo or $200 upfront
+
+Access to plugins and mods
+Access to builtin anticheat
+Access to Management Panel
+
+Enterprise Edition
+$50 / mo, or $300 upfront
+
+Access to plugins and mods
+Access to builtin anticheat
+Access to Management Panel
+Access to complimentary proxy
+Access to Administrative tools
+
+Network Edition
+Intended for those intending  to create a hosting service.
+$500 upfront, or paid in installments
+
+Access to management Panel
+Access to custom seats
+Access to payment software
+
+Special Access Edition
+Free (Limited Access)
+Access to all features except for networking edition.
+
+Features that set Smithing apart
+- Instant setup
+- Stream textures without external hosting
+- Automatic software updates
+- Quick hot modifications (Instantly changing the MOTD, mods, or plugins)
