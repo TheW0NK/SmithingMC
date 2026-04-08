@@ -1,238 +1,299 @@
-import com.google.gson.*;
-import java.io.*;
-import java.net.*;
-import java.nio.file.*;
-import java.security.*;
-import java.util.*;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-public class SmithingLauncher {
+/**
+ * SmithingMC runtime prototype.
+ *
+ * This file intentionally keeps the initial implementation in one place to make
+ * lifecycle and hot-swap behavior easy to evolve while architecture is still fluid.
+ */
+public final class SmithingMain {
 
-    private static final String VERSION_MANIFEST = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json";
-    private static final String TARGET_VERSION   = "1.21";
-    private static final Path   MINECRAFT_DIR    = Path.of(System.getProperty("user.home"), ".minecraft");
-    private static final Path   LIBRARIES_DIR    = MINECRAFT_DIR.resolve("libraries");
-    private static final Path   VERSIONS_DIR     = MINECRAFT_DIR.resolve("versions");
+    public static void main(String[] args) {
+        RuntimeConfig config = RuntimeConfig.fromJson(SmithingConfig.DEFAULT_JSON);
 
-    public static void main(String[] args) throws Exception {
-        printBanner();
-        log("Smithing compiled for Minecraft 1.21.11.");
-        log("Checking for Smithing License key...");
-        // TODO: Make license code check
-        log("Bypassed by Developer Mode.");
-        log("
-        ========= Welcome, {Username}. ========= \n
-        You are on the Professional edition of Smithing by Bypassware. \n
-        Your license key expires in: {Expiry Date}.\n
-        This version is in developer mode, meaning you are testing. Godspeed, {Username}. \n
-        ")
-        log("Resolving version manifest...");
-        String manifestJson = fetch(VERSION_MANIFEST);
-        String versionUrl   = resolveVersionUrl(manifestJson);
+        SmithingRuntime runtime = new SmithingRuntime(config);
+        runtime.start();
 
-        log("Fetching version JSON for " + TARGET_VERSION + "...");
-        String versionJson  = fetch(versionUrl);
-        JsonObject version  = JsonParser.parseString(versionJson).getAsJsonObject();
-
-        log("Resolving libraries...");
-        List<Path> classpath = resolveLibraries(version);
-
-        log("Resolving client JAR...");
-        Path clientJar = resolveClientJar(version);
-        classpath.add(clientJar);
-
-        log("Launching Minecraft " + TARGET_VERSION + "...");
-        launch(classpath, args);
+        // Demonstrate stable hot swapping of a module in place.
+        runtime.reloadModule("example:chatbridge");
+        runtime.stop();
     }
 
-    // ── Manifest ────────────────────────────────────────────────────────────────
+    /* ------------------------------ runtime core ----------------------------- */
 
-    private static String resolveVersionUrl(String manifestJson) {
-        JsonArray versions = JsonParser.parseString(manifestJson)
-                .getAsJsonObject()
-                .getAsJsonArray("versions");
+    static final class SmithingRuntime {
+        private final RuntimeConfig config;
+        private final ReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
+        private final Map<String, ManagedModule> loadedModules = new LinkedHashMap<>();
+        private final Map<String, ModuleProvider> providers = new LinkedHashMap<>();
 
-        for (JsonElement el : versions) {
-            JsonObject v = el.getAsJsonObject();
-            if (v.get("id").getAsString().equals(TARGET_VERSION)) {
-                return v.get("url").getAsString();
-            }
-        }
-        throw new RuntimeException("Version " + TARGET_VERSION + " not found in manifest.");
-    }
-
-    // ── Libraries ───────────────────────────────────────────────────────────────
-
-    private static List<Path> resolveLibraries(JsonObject version) throws Exception {
-        List<Path> paths = new ArrayList<>();
-        JsonArray libraries = version.getAsJsonArray("libraries");
-
-        for (JsonElement el : libraries) {
-            JsonObject lib      = el.getAsJsonObject();
-
-            // Skip libraries with OS rules that don't match
-            if (lib.has("rules") && !matchesRules(lib.getAsJsonArray("rules"))) continue;
-
-            JsonObject downloads = lib.getAsJsonObject("downloads");
-            if (downloads == null || !downloads.has("artifact")) continue;
-
-            JsonObject artifact = downloads.getAsJsonObject("artifact");
-            String     relPath  = artifact.get("path").getAsString();
-            String     url      = artifact.get("url").getAsString();
-            String     sha1     = artifact.get("sha1").getAsString();
-
-            Path dest = LIBRARIES_DIR.resolve(relPath);
-            downloadIfMissing(dest, url, sha1);
-            paths.add(dest);
+        SmithingRuntime(RuntimeConfig config) {
+            this.config = Objects.requireNonNull(config, "config");
+            registerProviders(config.enabledProviders());
         }
 
-        return paths;
-    }
+        void start() {
+            withWriteLock(() -> {
+                log("Starting Smithing runtime @ " + Instant.now());
+                for (ModuleSpec spec : config.modules()) {
+                    loadAndEnable(spec);
+                }
+                log("Runtime started with " + loadedModules.size() + " module(s).");
+            });
+        }
 
-    private static boolean matchesRules(JsonArray rules) {
-        String currentOs = getCurrentOs();
-        boolean allowed  = false;
+        void stop() {
+            withWriteLock(() -> {
+                log("Stopping Smithing runtime...");
+                List<ManagedModule> snapshot = new ArrayList<>(loadedModules.values());
+                for (int i = snapshot.size() - 1; i >= 0; i--) {
+                    ManagedModule module = snapshot.get(i);
+                    safelyDisableAndUnload(module);
+                }
+                loadedModules.clear();
+                log("Runtime stopped.");
+            });
+        }
 
-        for (JsonElement el : rules) {
-            JsonObject rule   = el.getAsJsonObject();
-            String     action = rule.get("action").getAsString();
-            boolean    hasOs  = rule.has("os");
+        void reloadModule(String moduleId) {
+            withWriteLock(() -> {
+                ManagedModule current = loadedModules.get(moduleId);
+                if (current == null) {
+                    log("Reload requested for unknown module: " + moduleId);
+                    return;
+                }
 
-            if (!hasOs) {
-                allowed = action.equals("allow");
-            } else {
-                String ruleOs = rule.getAsJsonObject("os").get("name").getAsString();
-                if (ruleOs.equals(currentOs)) {
-                    allowed = action.equals("allow");
+                log("Hot reloading module: " + moduleId);
+                ModuleSpec spec = current.spec();
+
+                safelyDisableAndUnload(current);
+                loadedModules.remove(moduleId);
+
+                try {
+                    loadAndEnable(spec);
+                    log("Reload succeeded: " + moduleId);
+                } catch (RuntimeException ex) {
+                    log("Reload failed for " + moduleId + ": " + ex.getMessage());
+                }
+            });
+        }
+
+        private void registerProviders(List<String> providerKeys) {
+            for (String raw : providerKeys) {
+                String provider = raw.toLowerCase(Locale.ROOT);
+                switch (provider) {
+                    case "paper" -> providers.put(provider, new PaperProvider());
+                    case "fabric" -> providers.put(provider, new FabricProvider());
+                    default -> log("Ignoring unsupported provider: " + provider);
                 }
             }
+            if (providers.isEmpty()) {
+                throw new IllegalStateException("No supported providers are enabled in configuration.");
+            }
         }
 
-        return allowed;
-    }
+        private void loadAndEnable(ModuleSpec spec) {
+            ModuleProvider provider = providers.get(spec.platform());
+            if (provider == null) {
+                throw new IllegalStateException("No provider registered for platform: " + spec.platform());
+            }
 
-    private static String getCurrentOs() {
-        String os = System.getProperty("os.name").toLowerCase();
-        if (os.contains("win"))   log("Windows is a heavy weight operating system. It is reccomended to run a server on Linux instead.");
-        if (os.contains("mac"))   log("Warning! MacOS is Not optimized for servers! Please switch to linux!")
-        if (os.contains("win"))   return "windows";
-        if (os.contains("mac"))   return "osx";
-        return "linux";
-    }
-
-    // ── Client JAR ──────────────────────────────────────────────────────────────
-
-    private static Path resolveClientJar(JsonObject version) throws Exception {
-        JsonObject client = version
-                .getAsJsonObject("downloads")
-                .getAsJsonObject("client");
-
-        String url  = client.get("url").getAsString();
-        String sha1 = client.get("sha1").getAsString();
-        Path   dest = VERSIONS_DIR.resolve(TARGET_VERSION).resolve(TARGET_VERSION + ".jar");
-
-        downloadIfMissing(dest, url, sha1);
-        return dest;
-    }
-
-    // ── Launch ──────────────────────────────────────────────────────────────────
-
-    private static void launch(List<Path> classpath, String[] extraArgs) throws Exception {
-        String java   = ProcessHandle.current().info().command().orElse("java");
-        String cp     = buildClasspath(classpath);
-        String mainClass = "net.minecraft.client.main.Main";
-
-        // Minimal required args Minecraft expects
-        List<String> cmd = new ArrayList<>(List.of(
-            java,
-            "-cp", cp,
-            mainClass,
-            "--version",    TARGET_VERSION,
-            "--accessToken", "0",           // offline mode
-            "--userType",   "legacy"
-        ));
-        log("
-        ======= WARNING: Your server is running in Offline Mode. ======= \n
-        Having offline mode enabled allows any user to join your server \n
-        using whatever username they want! This makes your server \n
-        vunerable to exploits allowing bad actors to spoof operators. \n
-        ")
-        cmd.addAll(List.of(extraArgs));
-
-        log("Spawning JVM...");
-        new ProcessBuilder(cmd)
-                .inheritIO()
-                .start()
-                .waitFor();
-    }
-
-    private static String buildClasspath(List<Path> paths) {
-        StringJoiner sj = new StringJoiner(File.pathSeparator);
-        for (Path p : paths) sj.add(p.toAbsolutePath().toString());
-        return sj.toString();
-    }
-
-    // ── Download ─────────────────────────────────────────────────────────────────
-
-    private static void downloadIfMissing(Path dest, String url, String expectedSha1) throws Exception {
-        if (Files.exists(dest) && sha1(dest).equalsIgnoreCase(expectedSha1)) {
-            log("  [cached] " + dest.getFileName());
-            return;
+            ManagedModule module = provider.instantiate(spec);
+            module.load();
+            module.enable();
+            loadedModules.put(spec.id(), module);
+            log("Loaded module " + spec.id() + " on platform " + spec.platform());
         }
 
-        log("  [download] " + dest.getFileName());
-        Files.createDirectories(dest.getParent());
-
-        try (InputStream in = URI.create(url).toURL().openStream()) {
-            Files.copy(in, dest, StandardCopyOption.REPLACE_EXISTING);
+        private void safelyDisableAndUnload(ManagedModule module) {
+            try {
+                module.disable();
+            } catch (RuntimeException ex) {
+                log("Disable error for " + module.spec().id() + ": " + ex.getMessage());
+            }
+            try {
+                module.unload();
+            } catch (RuntimeException ex) {
+                log("Unload error for " + module.spec().id() + ": " + ex.getMessage());
+            }
         }
 
-        String actual = sha1(dest);
-        if (!actual.equalsIgnoreCase(expectedSha1)) {
-            throw new RuntimeException("SHA1 mismatch for " + dest + ": expected " + expectedSha1 + ", got " + actual);
+        private void withWriteLock(Runnable action) {
+            lifecycleLock.writeLock().lock();
+            try {
+                action.run();
+            } finally {
+                lifecycleLock.writeLock().unlock();
+            }
+        }
+
+        private static void log(String message) {
+            System.out.println("[Smithing] " + message);
         }
     }
 
-    private static String sha1(Path path) throws Exception {
-        MessageDigest md = MessageDigest.getInstance("SHA-1");
-        md.update(Files.readAllBytes(path));
-        StringBuilder sb = new StringBuilder();
-        for (byte b : md.digest()) sb.append(String.format("%02x", b));
-        return sb.toString();
+    /* --------------------------- provider abstractions ----------------------- */
+
+    interface ModuleProvider {
+        ManagedModule instantiate(ModuleSpec spec);
     }
 
-    // ── HTTP ────────────────────────────────────────────────────────────────────
-
-    private static String fetch(String url) throws Exception {
-        HttpURLConnection conn = (HttpURLConnection) URI.create(url).toURL().openConnection();
-        conn.setRequestProperty("User-Agent", "SmithingLauncher/1.0");
-        try (InputStream in = conn.getInputStream()) {
-            return new String(in.readAllBytes());
+    static final class PaperProvider implements ModuleProvider {
+        @Override
+        public ManagedModule instantiate(ModuleSpec spec) {
+            return new ManagedModule(spec, "PaperAdapter");
         }
     }
 
-    // ── Util ─────────────────────────────────────────────────────────────────────
-
-    private static void log(String msg) {
-        System.out.println("[Smithing] " + msg);
+    static final class FabricProvider implements ModuleProvider {
+        @Override
+        public ManagedModule instantiate(ModuleSpec spec) {
+            return new ManagedModule(spec, "FabricAdapter");
+        }
     }
 
-    // ── Banner ───────────────────────────────────────────────────────────────────
+    static final class ManagedModule {
+        private final ModuleSpec spec;
+        private final String adapter;
 
-    private static void printBanner() {
-        System.out.println("""
-        ╔═════════════════════════════════════════════════════════════════════════════════╗
-        ║                                                                                 ║
-        ║          ░██████╗███╗░░░███╗██╗████████╗██╗░░██╗██╗███╗░░██╗░██████╗░           ║
-        ║          ██╔════╝████╗░████║██║╚══██╔══╝██║░░██║██║████╗░██║██╔════╝░           ║
-        ║          ╚█████╗░██╔████╔██║██║░░░██║░░░███████║██║██╔██╗██║██║░░██╗░           ║
-        ║          ░╚═══██╗██║╚██╔╝██║██║░░░██║░░░██╔══██║██║██║╚████║██║░░╚██╗           ║
-        ║          ██████╔╝██║░╚═╝░██║██║░░░██║░░░██║░░██║██║██║░╚███║╚██████╔╝           ║
-        ║          ╚═════╝░╚═╝░░░░░╚═╝╚═╝░░░╚═╝░░░╚═╝░░╚═╝╚═╝╚═╝░░╚══╝░╚═════╝░           ║
-        ║                                                                                 ║
-        ║                     Fabric + Bukkit — Unified Server                            ║
-        ║                              Version 1.0.0-alpha                                ║
-        ║                           Credit Phillip and Adrian                             ║
-        ╚═════════════════════════════════════════════════════════════════════════════════╝
-        """);
+        ManagedModule(ModuleSpec spec, String adapter) {
+            this.spec = spec;
+            this.adapter = adapter;
+        }
+
+        ModuleSpec spec() {
+            return spec;
+        }
+
+        void load() {
+            logState("load");
+        }
+
+        void enable() {
+            logState("enable");
+        }
+
+        void disable() {
+            logState("disable");
+        }
+
+        void unload() {
+            logState("unload");
+        }
+
+        private void logState(String phase) {
+            System.out.println("[" + adapter + "] " + spec.id() + " -> " + phase);
+        }
+    }
+
+    /* ---------------------------- configuration ------------------------------ */
+
+    record RuntimeConfig(List<String> enabledProviders, List<ModuleSpec> modules) {
+        static RuntimeConfig fromJson(String json) {
+            // Very small parser for the fixed prototype shape to avoid external deps.
+            String normalized = json.replace("\n", "").replace("\r", "").trim();
+
+            List<String> providers = extractStringArray(normalized, "enabledProviders");
+            List<ModuleSpec> modules = extractModules(normalized);
+
+            return new RuntimeConfig(providers, modules);
+        }
+
+        private static List<String> extractStringArray(String json, String key) {
+            String marker = "\"" + key + "\"";
+            int keyIndex = json.indexOf(marker);
+            if (keyIndex < 0) return List.of();
+
+            int start = json.indexOf('[', keyIndex);
+            int end = json.indexOf(']', start);
+            if (start < 0 || end < 0 || end <= start) return List.of();
+
+            String body = json.substring(start + 1, end).trim();
+            if (body.isEmpty()) return List.of();
+
+            String[] parts = body.split(",");
+            List<String> values = new ArrayList<>();
+            for (String part : parts) {
+                String value = part.trim();
+                if (value.startsWith("\"") && value.endsWith("\"")) {
+                    values.add(value.substring(1, value.length() - 1));
+                }
+            }
+            return values;
+        }
+
+        private static List<ModuleSpec> extractModules(String json) {
+            String marker = "\"modules\"";
+            int keyIndex = json.indexOf(marker);
+            if (keyIndex < 0) return List.of();
+
+            int start = json.indexOf('[', keyIndex);
+            int end = json.indexOf(']', start);
+            if (start < 0 || end < 0 || end <= start) return List.of();
+
+            String body = json.substring(start + 1, end);
+            String[] objects = body.split("\\},\\s*\\{");
+
+            List<ModuleSpec> modules = new ArrayList<>();
+            for (String obj : objects) {
+                String normalized = obj.replace("{", "").replace("}", "").trim();
+                if (normalized.isEmpty()) continue;
+
+                String id = extractField(normalized, "id");
+                String platform = extractField(normalized, "platform");
+                String artifact = extractField(normalized, "artifact");
+                if (!id.isBlank() && !platform.isBlank()) {
+                    modules.add(new ModuleSpec(id, platform.toLowerCase(Locale.ROOT), artifact));
+                }
+            }
+            return modules;
+        }
+
+        private static String extractField(String objectBody, String key) {
+            String marker = "\"" + key + "\"";
+            int keyIndex = objectBody.indexOf(marker);
+            if (keyIndex < 0) return "";
+
+            int colonIndex = objectBody.indexOf(':', keyIndex);
+            if (colonIndex < 0) return "";
+
+            int firstQuote = objectBody.indexOf('"', colonIndex);
+            int secondQuote = objectBody.indexOf('"', firstQuote + 1);
+            if (firstQuote < 0 || secondQuote < 0) return "";
+
+            return objectBody.substring(firstQuote + 1, secondQuote);
+        }
+    }
+
+    record ModuleSpec(String id, String platform, String artifact) {}
+
+    static final class SmithingConfig {
+        private SmithingConfig() {}
+
+        static final String DEFAULT_JSON = """
+            {
+              "enabledProviders": ["paper", "fabric"],
+              "modules": [
+                {
+                  "id": "example:chatbridge",
+                  "platform": "paper",
+                  "artifact": "plugins/chatbridge.jar"
+                },
+                {
+                  "id": "example:worldsync",
+                  "platform": "fabric",
+                  "artifact": "mods/worldsync.jar"
+                }
+              ]
+            }
+            """;
     }
 }

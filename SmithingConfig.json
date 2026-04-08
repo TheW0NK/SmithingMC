@@ -1,0 +1,15 @@
+{
+  "enabledProviders": ["paper", "fabric"],
+  "modules": [
+    {
+      "id": "example:chatbridge",
+      "platform": "paper",
+      "artifact": "plugins/chatbridge.jar"
+    },
+    {
+      "id": "example:worldsync",
+      "platform": "fabric",
+      "artifact": "mods/worldsync.jar"
+    }
+  ]
+}
