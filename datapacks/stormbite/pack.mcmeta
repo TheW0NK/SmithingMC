@@ -1,0 +1,10 @@
+{
+  "pack": {
+    "pack_format": 61,
+    "description": "Stormbite enchantment: lightning strikes targets, applies Slowness I + Weakness I, and costs extra durability.",
+    "supported_formats": {
+      "min_inclusive": 57,
+      "max_inclusive": 99
+    }
+  }
+}
